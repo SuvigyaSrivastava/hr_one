@@ -155,12 +155,14 @@ def test_list_attendance_sort_filters_total(api):
     assert r["total"] == 0 and r["items"] == []
 
 
-def test_list_attendance_secondary_sort_emp_code(api):
-    seed_days(api, "EMP9002", 1)
-    seed_days(api, "EMP9001", 1)
-    items = api.get("/attendance", params={"date_from": "2026-07-06", "date_to": "2026-07-06"}).json()["items"]
-    codes = [i["emp_code"] for i in items if i["emp_code"].startswith("EMP9")]
-    assert codes == ["EMP9001", "EMP9002"]
+def test_list_attendance_secondary_sort_emp_code(api, mongo_db):
+    # an isolated date, so the result is the same on a small database and on the 100k load database
+    for code in ("EMP9002", "EMP9001", "EMP9003"):
+        mongo_db.attendance_logs.insert_one({"emp_code": code, "date": "2031-05-05", "status": "PRESENT", "punch_in": None,
+                                             "punch_out": None, "work_hours": None, "late_minutes": 0,
+                                             "overtime_minutes": 0, "half_day": False, "history": []})
+    items = api.get("/attendance", params={"date_from": "2031-05-05", "date_to": "2031-05-05"}).json()["items"]
+    assert [i["emp_code"] for i in items] == ["EMP9001", "EMP9002", "EMP9003"]
 
 
 def test_list_attendance_item_shape(api):

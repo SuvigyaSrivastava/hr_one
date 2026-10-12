@@ -12,6 +12,7 @@ Layout of this file (everything lives here by assignment rule):
   5. Indexes                 - created idempotently at startup
   6. Endpoints
 """
+import json
 import logging
 import os
 import re
@@ -20,6 +21,7 @@ from datetime import date as Date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
@@ -447,6 +449,12 @@ def build_attendance_query(emp_code: Optional[str], date_from: Optional[str], da
     return query
 
 
+def build_attendance_find(query: dict, page: int, page_size: int) -> dict:
+    """The one definition of the list query; used by GET /attendance and by /admin/explain/attendance_list."""
+    return {"filter": query, "projection": {"_id": 0}, "sort": ATTENDANCE_SORT,
+            "skip": (page - 1) * page_size, "limit": page_size}
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -458,8 +466,9 @@ def list_attendance(
 ):
     query = build_attendance_query(emp_code, date_from, date_to, status)
     total = attendance.count_documents(query)
-    cursor = attendance.find(query, {"_id": 0}).sort(ATTENDANCE_SORT).skip((page - 1) * page_size).limit(page_size)
-    return {"items": [serialize_attendance(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+    spec = build_attendance_find(query, page, page_size)
+    items = [serialize_attendance(d) for d in attendance.find(**spec)]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 MAX_SHIFT_SECONDS = 24 * 60 * 60
@@ -838,10 +847,7 @@ def _rate(value: Optional[float]) -> Optional[float]:
 def department_trend(department: str, day_from: Annotated[DateStr, Query(alias="from")],
                      day_to: Annotated[DateStr, Query(alias="to")]):
     d_from, d_to = Date.fromisoformat(day_from), Date.fromisoformat(day_to)
-    if d_to < d_from:
-        invalid(["query", "to"], "to must not be before from", day_to)
-    if (d_to - d_from).days + 1 > MAX_TREND_DAYS:
-        invalid(["query", "to"], f"the range must not exceed {MAX_TREND_DAYS} days", day_to)
+    validate_trend_range(d_from, d_to)
     if employees.find_one({"department": department}, {"_id": 1}) is None:
         raise HTTPException(404, "department not found")
     coll, pipeline = build_department_trend(department, d_from, d_to)
@@ -858,6 +864,66 @@ def department_trend(department: str, day_from: Annotated[DateStr, Query(alias="
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# Part C: GET /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+ExplainEndpoint = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard",
+                          "department_trend"]
+_MONTH_PATTERN = r"^[0-9]{4}-(0[1-9]|1[0-2])$"
+
+
+def _require(**params: Any) -> None:
+    for name, value in params.items():
+        if value is None:
+            invalid(["query", name], f"{name} is required for this endpoint")
+
+
+def validate_trend_range(d_from: Date, d_to: Date) -> None:
+    if d_to < d_from:
+        invalid(["query", "to"], "to must not be before from", d_to.isoformat())
+    if (d_to - d_from).days + 1 > MAX_TREND_DAYS:
+        invalid(["query", "to"], f"the range must not exceed {MAX_TREND_DAYS} days", d_to.isoformat())
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainEndpoint,
+    emp_code: Optional[str] = None,
+    month: Annotated[Optional[str], Query(pattern=_MONTH_PATTERN)] = None,
+    department: Optional[str] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    date_from: Annotated[Optional[DateStr], Query()] = None,
+    date_to: Annotated[Optional[DateStr], Query()] = None,
+    status: Optional[Status] = None,
+    day_from: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    day_to: Annotated[Optional[DateStr], Query(alias="to")] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    """MongoDB `explain` (executionStats) of the endpoint's main query, built by the very same builder functions."""
+    if month is not None:
+        _check_month(month)
+    if endpoint == "attendance_list":
+        query = build_attendance_query(emp_code, date_from, date_to, status)
+        spec = build_attendance_find(query, page, page_size)
+        collection = "attendance_logs"
+        command: dict = {"find": collection, "filter": spec["filter"], "projection": spec["projection"],
+                         "sort": dict(spec["sort"]), "skip": spec["skip"], "limit": spec["limit"]}
+    else:
+        if endpoint == "employee_monthly":
+            _require(emp_code=emp_code, month=month)
+            collection, pipeline = build_employee_monthly(emp_code, month)
+        elif endpoint == "department_summary":
+            _require(month=month)
+            collection, pipeline = build_department_summary(month, department)
+        elif endpoint == "late_leaderboard":
+            _require(month=month)
+            collection, pipeline = build_late_leaderboard(month, limit, department)
+        else:  # department_trend
+            _require(department=department, **{"from": day_from, "to": day_to})
+            d_from, d_to = Date.fromisoformat(day_from), Date.fromisoformat(day_to)
+            validate_trend_range(d_from, d_to)
+            collection, pipeline = build_department_trend(department, d_from, d_to)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    raw = db.command({"explain": command, "verbosity": "executionStats"})
+    return {"endpoint": endpoint, "collection": collection,
+            "explain": json.loads(json_util.dumps(raw, json_options=json_util.RELAXED_JSON_OPTIONS))}
