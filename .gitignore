@@ -6,3 +6,10 @@ __pycache__/
 .pytest_cache/
 .idea/
 .vscode/
+
+# candidate-only kit material: kept on disk, never published
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+sample_data/
+sample_seed.py

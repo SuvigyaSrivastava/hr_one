@@ -1,5 +1,5 @@
 """Live-API tests for employees, punch-in, health and the attendance list (starter endpoints)."""
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
