@@ -10,6 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -45,6 +46,121 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     h, m = map(int, shift_end.split(":"))
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
     return max(0, int((punch_out - end).total_seconds() / 60))
+
+
+# --------------------------------------------------------------------------- #
+# Rules engine (R1 - R5, R8): pure functions, no database access
+# --------------------------------------------------------------------------- #
+UTC = timezone.utc
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+GRACE_SECONDS = 10 * 60              # R2: late only if strictly more than 10:00 after shift start
+OVERTIME_MIN_MINUTES = 30            # R3
+HALF_DAY_THRESHOLD = Decimal("4.50")  # R5 (compared against the ROUNDED work hours)
+PRESENCE_STATUSES = ("PRESENT", "WFH", "ON_DUTY")      # R6
+NON_PRESENCE_STATUSES = ("ABSENT", "LEAVE")
+ALL_STATUSES = PRESENCE_STATUSES + NON_PRESENCE_STATUSES
+
+
+def round_half_up(value, places: int = 2) -> float:
+    """R8: half-up rounding (not banker's, not binary-float rounding)."""
+    quantum = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def to_utc(dt: datetime) -> datetime:
+    """Mongo may hand back naive datetimes (always UTC); make everything tz-aware UTC."""
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def ms_to_dt(ms: int) -> datetime:
+    """Epoch ms -> UTC datetime, truncated to whole seconds (R1)."""
+    return EPOCH + timedelta(seconds=ms // 1000)
+
+
+def dt_to_ms(dt: datetime) -> int:
+    """UTC/naive datetime -> epoch ms, truncated to whole seconds."""
+    return ((to_utc(dt) - EPOCH) // timedelta(seconds=1)) * 1000
+
+
+def trunc_seconds(dt: datetime) -> datetime:
+    return to_utc(dt).replace(microsecond=0)
+
+
+def hhmm_to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def is_overnight(shift_start: str, shift_end: str) -> bool:
+    return hhmm_to_minutes(shift_end) <= hhmm_to_minutes(shift_start)
+
+
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
+    """R1: IST calendar date of the punch-in; for overnight shifts a punch-in earlier than
+    shift_end belongs to the shift that started the previous day."""
+    local = trunc_seconds(punch_in).astimezone(IST)
+    day = local.date()
+    if is_overnight(shift_start, shift_end):
+        minutes_into_day = local.hour * 60 + local.minute
+        if minutes_into_day < hhmm_to_minutes(shift_end):
+            day -= timedelta(days=1)
+    return day.isoformat()
+
+
+def _ist_at(date_str: str, hhmm: str, plus_days: int = 0) -> datetime:
+    d = datetime.strptime(date_str, "%Y-%m-%d").date() + timedelta(days=plus_days)
+    h, m = divmod(hhmm_to_minutes(hhmm), 60)
+    return datetime(d.year, d.month, d.day, h, m, tzinfo=IST)
+
+
+def shift_start_at(date_str: str, shift_start: str) -> datetime:
+    return _ist_at(date_str, shift_start)
+
+
+def shift_end_at(date_str: str, shift_start: str, shift_end: str) -> datetime:
+    """The overnight shift's end falls on the next calendar day."""
+    return _ist_at(date_str, shift_end, 1 if is_overnight(shift_start, shift_end) else 0)
+
+
+def calc_late_minutes(punch_in: datetime, date_str: str, shift_start: str) -> int:
+    """R2: late only if strictly > 10:00 after shift start; then floor minutes since shift start."""
+    delta = int((trunc_seconds(punch_in) - shift_start_at(date_str, shift_start)).total_seconds())
+    return delta // 60 if delta > GRACE_SECONDS else 0
+
+
+def calc_overtime_minutes(punch_out: datetime, date_str: str, shift_start: str, shift_end: str) -> int:
+    """R3: floor minutes from shift_end to punch_out, counted only when >= 30."""
+    delta = int((trunc_seconds(punch_out) - shift_end_at(date_str, shift_start, shift_end)).total_seconds())
+    minutes = delta // 60
+    return minutes if minutes >= OVERTIME_MIN_MINUTES else 0
+
+
+def calc_work_hours(punch_in: datetime, punch_out: datetime) -> float:
+    """R4: seconds / 3600, rounded to 2 decimals half-up."""
+    seconds = int((trunc_seconds(punch_out) - trunc_seconds(punch_in)).total_seconds())
+    return round_half_up(Decimal(seconds) / Decimal(3600), 2)
+
+
+def calc_half_day(work_hours: Optional[float]) -> bool:
+    """R5: based on the rounded work hours."""
+    return work_hours is not None and Decimal(str(work_hours)) < HALF_DAY_THRESHOLD
+
+
+def compute_derived(status: str, punch_in: Optional[datetime], punch_out: Optional[datetime],
+                    date_str: str, shift_start: str, shift_end: str) -> dict:
+    """All stored derived fields for a record (DATA_MODEL.md table)."""
+    if status not in PRESENCE_STATUSES or punch_in is None:
+        return {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    late = calc_late_minutes(punch_in, date_str, shift_start)
+    if punch_out is None:
+        return {"work_hours": None, "late_minutes": late, "overtime_minutes": 0, "half_day": False}
+    work_hours = calc_work_hours(punch_in, punch_out)
+    return {
+        "work_hours": work_hours,
+        "late_minutes": late,
+        "overtime_minutes": calc_overtime_minutes(punch_out, date_str, shift_start, shift_end),
+        "half_day": calc_half_day(work_hours),
+    }
 
 
 # --------------------------------------------------------------------------- #
