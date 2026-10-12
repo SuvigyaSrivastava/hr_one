@@ -16,7 +16,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date as Date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any, Literal, Optional
 
@@ -188,6 +188,15 @@ Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
 PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
 Page = Annotated[int, Query(ge=1, le=MAX_PAGE)]
 PageSize = Annotated[int, Query(ge=1, le=100)]
+
+
+def _check_month(value: str) -> str:
+    if not 1970 <= int(value[:4]) <= 2100:
+        raise ValueError("year must be between 1970 and 2100")
+    return value
+
+
+MonthStr = Annotated[str, Query(pattern=r"^[0-9]{4}-(0[1-9]|1[0-2])$"), AfterValidator(_check_month)]
 
 
 class EmployeeCreate(BaseModel):
@@ -595,9 +604,143 @@ def regularize_attendance(emp_code: str, date: Annotated[DateStr, Path()], body:
 
 
 # --------------------------------------------------------------------------- #
+# Analytics: shared helpers
+# --------------------------------------------------------------------------- #
+def month_bounds(month: str) -> tuple:
+    """'2026-07' -> (first day, last day, first day of next month) as datetime.date objects."""
+    y, m = int(month[:4]), int(month[5:])
+    first = Date(y, m, 1)
+    nxt = Date(y + (m == 12), m % 12 + 1, 1)
+    return first, nxt - timedelta(days=1), nxt
+
+
+def count_working_days(start: Date, end: Date) -> int:
+    """Mon-Fri days in [start, end] (R7: no holiday calendar). Pure calendar arithmetic over at most a month."""
+    return sum(1 for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() < 5)
+
+
+# Aggregation fragments. Stored derived values are authoritative (never recomputed from punch times);
+# missing fields on legacy documents default to 0 / false.
+_DOW = {"$dayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d", "onError": None, "onNull": None}}}
+_IS_WEEKDAY = {"$and": [{"$gte": ["$dow", 2]}, {"$lte": ["$dow", 6]}]}          # $dayOfWeek: 1 = Sunday .. 7 = Saturday
+_IS_PRESENT = {"$in": ["$status", list(PRESENCE_STATUSES)]}                      # R6
+_HAS_HOURS = {"$and": [_IS_PRESENT, {"$isNumber": "$work_hours"}]}
+_LATE = {"$ifNull": ["$late_minutes", 0]}
+
+
+def _stats_accumulators() -> dict:
+    """$group accumulators shared by the per-employee and the per-department aggregations."""
+    return {
+        # R5-R7: present weekday records, half day = 0.5; weekend records never add to present_days
+        "present_days": {"$sum": {"$cond": [
+            {"$and": [_IS_PRESENT, _IS_WEEKDAY]},
+            {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+            0]}},
+        "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+        "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
+        # late / overtime totals include weekend records
+        "late_count": {"$sum": {"$cond": [{"$gt": [_LATE, 0]}, 1, 0]}},
+        "total_late_minutes": {"$sum": _LATE},
+        "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        # work hours are summed as integer hundredths so the final mean can be rounded half-up exactly
+        "hours_cents": {"$sum": {"$cond": [_HAS_HOURS, {"$round": [{"$multiply": ["$work_hours", 100]}, 0]}, 0]}},
+        "hours_n": {"$sum": {"$cond": [_HAS_HOURS, 1, 0]}},
+    }
+
+
+def build_employee_monthly(emp_code: str, month: str) -> tuple:
+    first, _, nxt = month_bounds(month)
+    pipeline = [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lt": nxt.isoformat()}}},
+        {"$addFields": {"dow": _DOW}},
+        {"$group": {"_id": None, **_stats_accumulators()}},
+    ]
+    return "attendance_logs", pipeline
+
+
+def build_department_summary(month: str, department: Optional[str]) -> tuple:
+    """Starts from `employees` so that people without any log still count towards the headcount (R9);
+    each employee's month is aggregated inside the $lookup (one row per employee), then rolled up per department.
+    Because the per-employee rows are summed, the average is over records, not an average of averages."""
+    first, last, nxt = month_bounds(month)
+    emp_match: dict = {"joined_on": {"$lte": last.isoformat()}}
+    if department:
+        emp_match["department"] = department
+    pipeline = [
+        {"$match": emp_match},
+        {"$lookup": {
+            "from": "attendance_logs", "localField": "emp_code", "foreignField": "emp_code",   # uses (emp_code, date)
+            "pipeline": [
+                {"$match": {"date": {"$gte": first.isoformat(), "$lt": nxt.isoformat()}}},
+                {"$addFields": {"dow": _DOW}},
+                {"$group": {"_id": None, **_stats_accumulators()}},
+            ],
+            "as": "s",
+        }},
+        {"$project": {"_id": 0, "department": 1, "s": {"$ifNull": [{"$arrayElemAt": ["$s", 0]}, {}]}}},
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            **{k: {"$sum": {"$ifNull": [f"$s.{k}", 0]}} for k in (
+                "present_days", "leave_days", "on_duty_count", "late_count", "total_late_minutes",
+                "hours_cents", "hours_n")},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    return "employees", pipeline
+
+
+def attendance_pct(present_days: float, working_days: int) -> Optional[float]:
+    if working_days == 0:
+        return None
+    return round_half_up(Decimal(str(present_days)) / Decimal(working_days) * 100, 2)   # R8
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: MonthStr):
+    emp = employees.find_one({"emp_code": emp_code}, {"_id": 0, "joined_on": 1})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    first, last, _ = month_bounds(month)
+    coll, pipeline = build_employee_monthly(emp_code, month)
+    rows = list(db[coll].aggregate(pipeline))
+    agg = rows[0] if rows else {}
+    working_days = count_working_days(max(first, Date.fromisoformat(emp["joined_on"])), last)      # R7
+    present = agg.get("present_days", 0)
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": round_half_up(present, 2),
+        "leave_days": int(agg.get("leave_days", 0)),
+        "late_count": int(agg.get("late_count", 0)),
+        "total_late_minutes": int(agg.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(agg.get("total_overtime_minutes", 0)),
+        "attendance_pct": attendance_pct(present, working_days),
+    }
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: MonthStr, department: Optional[str] = None):
+    coll, pipeline = build_department_summary(month, department)
+    items = []
+    for r in db[coll].aggregate(pipeline):
+        n = int(r["hours_n"])
+        items.append({
+            "department": r["_id"],
+            "headcount": int(r["headcount"]),
+            "present_days": round_half_up(r["present_days"], 2),
+            "avg_work_hours": round_half_up(Decimal(int(r["hours_cents"])) / Decimal(n) / Decimal(100), 2) if n else None,
+            "late_count": int(r["late_count"]),
+            "total_late_minutes": int(r["total_late_minutes"]),
+            "leave_count": int(r["leave_days"]),
+            "on_duty_count": int(r["on_duty_count"]),
+        })
+    return {"month": month, "items": items}
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
